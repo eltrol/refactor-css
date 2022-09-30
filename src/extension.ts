@@ -283,6 +283,7 @@ export async function activate(context: vscode.ExtensionContext) {
             { scheme: 'file', language: 'haml', },
             { scheme: 'file', language: 'leaf', },
             { scheme: 'file', language: 'vue' },
+            { scheme: 'file', language: 'svelte' },
         ],
         {
             provideHover: (document, position) => {
