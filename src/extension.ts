@@ -1,10 +1,24 @@
 import * as fs from 'fs';
 import * as vscode from 'vscode';
+import { commands, workspace, ExtensionContext, Range, window } from 'vscode';
 import Fetcher from "./fetcher";
 import { promisify } from 'util';
-const lineColumn = require('line-column');
+import lineColumn from 'line-column';
+import {
+    type LangConfig,
+    sortClassString, getTextMatch, buildMatchers, config,
+    langConfig,
+    sortOrder,
+    customTailwindPrefixConfig,
+    customTailwindPrefix,
+    shouldRemoveDuplicatesConfig,
+    shouldRemoveDuplicates,
+    shouldPrependCustomClassesConfig,
+    shouldPrependCustomClasses } from './utils';
+import { spawn } from 'child_process';
+import { rustyWindPath } from 'rustywind';
 
-let caching: boolean = false;
+let caching = false;
 
 interface ClassesWrapper {
     classes: string[];
@@ -63,12 +77,13 @@ async function cache(): Promise<void> {
 }
 
 function getClassesFromDocument(document: Document) {
-    let match;
+	let match: RegExpExecArray;
     const regEx = /\bclass(Name)?=['"]([^'"]*)*/g;
     const text = document.getText();
     let currentClasses: ClassesWrapper | undefined;
-    document.classesWrappers = [];
-    while (match = regEx.exec(text)) {
+	document.classesWrappers = [];
+	match = regEx.exec(text);
+    while (match) {
         // Get unique classes
         const classes: string[] = [...new Set(match[2].replace(/['"]+/g, '').match(/\S+/g))] || [];
         const startIndex = match.index + (match[0].length - match[2].length);
@@ -118,9 +133,19 @@ function getClassesFromDocument(document: Document) {
 
             };
             document.classesWrappers.push(currentClasses);
-        }
+		}
+		match = regEx.exec(text);
     }
 }
+
+const documentSelector: vscode.DocumentSelector = [
+	{ scheme: 'file', language: "html" },
+	{ scheme: 'file', language: "php" },
+	{ scheme: 'file', language: "markdown" },
+	{ scheme: 'file', language: "pug" },
+	{ scheme: 'file', language: "vue" },
+	{ scheme: 'file', language: "svelte" },
+];
 
 export async function activate(context: vscode.ExtensionContext) {
     const configuration = vscode.workspace.getConfiguration();
@@ -129,7 +154,11 @@ export async function activate(context: vscode.ExtensionContext) {
     const workspaceRootPath: string | undefined = vscode.workspace.rootPath;
     let hoveredClasses: ClassesWrapper | undefined;
     let timeout: NodeJS.Timer | null = null;
-    const decorations: vscode.DecorationOptions[] = [];
+	const decorations: vscode.DecorationOptions[] = [];
+	const output = vscode.window.createOutputChannel('Refactor CSS');
+
+	output.appendLine('Refactor CSS extension activated');
+
 
     caching = true;
 
@@ -233,7 +262,8 @@ export async function activate(context: vscode.ExtensionContext) {
                     return prev + equalWrapper.ranges.length;
                 }, 0);
 
-                if (classesWrapper.classes.length >= CLASSES_MINIMUM && occurrences >= OCCURRENCE_MINIMUM) {
+				if (classesWrapper.classes.length >= CLASSES_MINIMUM && occurrences >= OCCURRENCE_MINIMUM) {
+					console.log(classesWrapper.classes, occurrences);
                     for (const range of classesWrapper.ranges) {
                         const decoration: vscode.DecorationOptions = { range };
                         decorations.push(decoration);
@@ -265,26 +295,10 @@ export async function activate(context: vscode.ExtensionContext) {
         fileWatcher.onDidCreate(uri => addDocument(uri));
         fileWatcher.onDidChange(uri => addDocument(uri));
         fileWatcher.onDidDelete(uri => removeDocument(uri));
-    }
+	}
+	
 
-    vscode.languages.registerHoverProvider(
-        [
-            { scheme: 'file', language: 'html', },
-            { scheme: 'file', language: 'jade', },
-            { scheme: 'file', language: 'razor', },
-            { scheme: 'file', language: 'php', },
-            { scheme: 'file', language: 'blade', },
-            { scheme: 'file', language: 'twig', },
-            { scheme: 'file', language: 'markdown', },
-            { scheme: 'file', language: 'erb', },
-            { scheme: 'file', language: 'handlebars', },
-            { scheme: 'file', language: 'ejs', },
-            { scheme: 'file', language: 'nunjucks', },
-            { scheme: 'file', language: 'haml', },
-            { scheme: 'file', language: 'leaf', },
-            { scheme: 'file', language: 'vue' },
-            { scheme: 'file', language: 'svelte' },
-        ],
+    vscode.languages.registerHoverProvider(documentSelector,
         {
             provideHover: (document, position) => {
                 const range1: vscode.Range = new vscode.Range(
@@ -386,7 +400,91 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         }
     );
-}
 
-export function deactivate() {
+
+    const disposable = commands.registerTextEditorCommand(
+		'refactor-css.sortTailwindClasses',
+		function (editor, edit) {
+			const editorText = editor.document.getText();
+			const editorLangId = editor.document.languageId;
+
+			const matchers = buildMatchers(
+				langConfig[editorLangId] || langConfig['html']
+			);
+
+			for (const matcher of matchers) {
+				getTextMatch(matcher.regex, editorText, (text, startPosition) => {
+					const endPosition = startPosition + text.length;
+					const range = new Range(
+						editor.document.positionAt(startPosition),
+						editor.document.positionAt(endPosition)
+					);
+
+					const options = {
+						shouldRemoveDuplicates,
+						shouldPrependCustomClasses,
+						customTailwindPrefix,
+						separator: matcher.separator,
+						replacement: matcher.replacement,
+					};
+
+					edit.replace(
+						range,
+						sortClassString(
+							text,
+							Array.isArray(sortOrder) ? sortOrder : [],
+							options
+						)
+					);
+				});
+			}
+		}
+	);
+
+	const runOnProject = commands.registerCommand(
+		'refactor-css.sortTailwindClassesOnWorkspace',
+		() => {
+			const workspaceFolder = workspace.workspaceFolders || [];
+			if (workspaceFolder[0]) {
+				window.showInformationMessage(
+					`Running Refactor-CSS:Headwind on: ${workspaceFolder[0].uri.fsPath}`
+				);
+
+				const rustyWindArgs = [
+					workspaceFolder[0].uri.fsPath,
+					'--write',
+					shouldRemoveDuplicates ? '' : '--allow-duplicates',
+				].filter((arg) => arg !== '');
+
+				const rustyWindProc = spawn(rustyWindPath, rustyWindArgs);
+
+				rustyWindProc.stdout.on(
+					'data',
+					(data) =>
+						data &&
+						data.toString() !== '' &&
+						console.log('rustywind stdout:\n', data.toString())
+				);
+
+				rustyWindProc.stderr.on('data', (data) => {
+					if (data && data.toString() !== '') {
+						console.log('rustywind stderr:\n', data.toString());
+						window.showErrorMessage(`Refactor-CSS:Headwind error: ${data.toString()}`);
+					}
+				});
+			}
+		}
+	);
+
+	context.subscriptions.push(runOnProject);
+	context.subscriptions.push(disposable);
+
+	// if runOnSave is enabled organize tailwind classes before saving
+	if (config.get('refactor-css.runOnSave')) {
+		context.subscriptions.push(
+			workspace.onWillSaveTextDocument((_e) => {
+				commands.executeCommand('refactor-css.sortTailwindClasses');
+			})
+		);
+	}
 }
